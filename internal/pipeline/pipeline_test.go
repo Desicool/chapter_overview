@@ -601,6 +601,54 @@ func TestBuildFallbackSummary_EmptyText(t *testing.T) {
 	}
 }
 
+func TestBuildFallbackSummary_GarbledPUA(t *testing.T) {
+	// Simulate ledongthuc/pdf private-use-area output (unmapped CID glyphs).
+	garbled := ""
+	summary, status := buildFallbackSummary(garbled)
+	if status != model.SummaryFailed {
+		t.Errorf("status = %q; want %q", status, model.SummaryFailed)
+	}
+	if summary != fallbackGarbledWarning {
+		t.Errorf("expected garbled warning; got %q", summary)
+	}
+}
+
+func TestBuildFallbackSummary_GarbledMixed(t *testing.T) {
+	// A few ASCII chars drowned in PUA noise → ratio below threshold.
+	garbled := "ab" + strings.Repeat("", 20)
+	summary, status := buildFallbackSummary(garbled)
+	if status != model.SummaryFailed {
+		t.Errorf("status = %q; want %q", status, model.SummaryFailed)
+	}
+	if strings.Contains(summary, "") {
+		t.Error("garbled runes must not appear in fallback output")
+	}
+}
+
+func TestBuildFallbackSummary_CleanCJK(t *testing.T) {
+	// Readable Chinese text — should produce SummaryFallback with excerpt.
+	cjk := "本章节主要介绍了税务管理的基本原则和操作流程，包括申报要求和缴纳期限的详细说明。"
+	summary, status := buildFallbackSummary(cjk)
+	if status != model.SummaryFallback {
+		t.Errorf("status = %q; want %q", status, model.SummaryFallback)
+	}
+	if !strings.Contains(summary, "本章") {
+		t.Error("CJK excerpt should appear in fallback summary")
+	}
+}
+
+func TestBuildFallbackSummary_ControlCharsStripped(t *testing.T) {
+	// Control chars mixed with readable ASCII.
+	mixed := "Good text\x01\x02\x03 more good text here to exceed the threshold clearly."
+	summary, status := buildFallbackSummary(mixed)
+	if status != model.SummaryFallback {
+		t.Errorf("status = %q; want %q for readable text", status, model.SummaryFallback)
+	}
+	if strings.ContainsAny(summary, "\x01\x02\x03") {
+		t.Error("control chars must be stripped from fallback output")
+	}
+}
+
 // ---------------------------------------------------------------------------
 // tryLLMSummary: refusal JSON + heuristic
 // ---------------------------------------------------------------------------

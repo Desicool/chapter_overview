@@ -10,6 +10,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode"
 
 	"github.com/desico/chapter-overview/internal/model"
 	"github.com/desico/chapter-overview/internal/pdf"
@@ -377,26 +378,91 @@ func looksLikeRefusal(s string) bool {
 	return false
 }
 
-const fallbackWarning = "[warning: may contain inappropriate content, LLM could not summarize]"
+const fallbackWarning = "[warning: LLM could not summarize this chapter]"
+const fallbackGarbledWarning = "[warning: LLM could not summarize — text extraction produced unreadable output]"
 const fallbackTextLimit = 150
 
-// buildFallbackSummary returns a warning-prefixed excerpt of the extracted text.
-// If the text is empty, returns the warning alone with SummaryFailed.
+// readabilityThreshold is the minimum ratio of recognizable runes required to
+// show an excerpt; below this the extracted text is considered garbled.
+const readabilityThreshold = 0.6
+
+// buildFallbackSummary returns a warning-prefixed excerpt of the extracted text
+// when readable, or a garbled-text warning when the extraction looks like noise.
 func buildFallbackSummary(fullText string) (string, model.SummaryStatus) {
-	trimmed := strings.TrimSpace(fullText)
-	if trimmed == "" {
+	if strings.TrimSpace(fullText) == "" {
 		return fallbackWarning, model.SummaryFailed
 	}
-	excerpt := trimmed
+	// Score readability on the raw text to catch cases where a few ASCII chars
+	// are drowned in a sea of PUA/garbled runes.
+	if !isReadable(fullText) {
+		return fallbackGarbledWarning, model.SummaryFailed
+	}
+	// Text is readable; sanitize control/PUA chars before displaying the excerpt.
+	sanitized := sanitizeExtractedText(fullText)
+	if sanitized == "" {
+		return fallbackGarbledWarning, model.SummaryFailed
+	}
+	excerpt := sanitized
 	if len(excerpt) > fallbackTextLimit {
 		excerpt = excerpt[:fallbackTextLimit]
-		// try to truncate at a word boundary
 		if idx := strings.LastIndexAny(excerpt, " \n\t"); idx > fallbackTextLimit/2 {
 			excerpt = excerpt[:idx]
 		}
 		excerpt = strings.TrimRight(excerpt, " \n\t.,;:") + "..."
 	}
 	return fallbackWarning + "\n\n" + excerpt, model.SummaryFallback
+}
+
+// sanitizeExtractedText strips control characters, Unicode replacement runes
+// (U+FFFD), and private-use-area runes (U+E000–U+F8FF) that ledongthuc/pdf
+// emits when CID-to-Unicode mapping fails.
+func sanitizeExtractedText(s string) string {
+	var b strings.Builder
+	b.Grow(len(s))
+	for _, r := range s {
+		switch {
+		case r == '\n' || r == '\t':
+			b.WriteRune(r)
+		case r < 0x20:
+			// skip other control chars
+		case r == '�':
+			// replacement rune — unmapped glyph
+		case r >= 0xE000 && r <= 0xF8FF:
+			// private-use area — ledongthuc CID fallback
+		default:
+			b.WriteRune(r)
+		}
+	}
+	return strings.TrimSpace(b.String())
+}
+
+// isReadable returns true when at least readabilityThreshold of the
+// non-whitespace runes in s are ASCII printable, CJK ideographs, or CJK
+// punctuation. A single-pass check; designed to run on short excerpts (<1ms).
+func isReadable(s string) bool {
+	var total, recognizable int
+	for _, r := range s {
+		if unicode.IsSpace(r) {
+			continue
+		}
+		total++
+		switch {
+		case r >= 0x20 && r <= 0x7E: // ASCII printable
+			recognizable++
+		case r >= 0x4E00 && r <= 0x9FFF: // CJK unified ideographs
+			recognizable++
+		case r >= 0x3000 && r <= 0x303F: // CJK symbols and punctuation
+			recognizable++
+		case r >= 0xFF00 && r <= 0xFFEF: // halfwidth/fullwidth forms
+			recognizable++
+		case unicode.IsLetter(r) || unicode.IsNumber(r): // other scripts (Latin ext, Cyrillic, etc.)
+			recognizable++
+		}
+	}
+	if total == 0 {
+		return false
+	}
+	return float64(recognizable)/float64(total) >= readabilityThreshold
 }
 
 // kind labels a chapter boundary as front matter, content, or back matter.
