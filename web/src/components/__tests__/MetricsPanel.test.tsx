@@ -11,6 +11,7 @@ const mockStats: Stats = {
   total_duration_ms: 75000,
   p90_duration_ms: 62000,
   p99_duration_ms: 74000,
+  elapsed_ms: 62000,
 }
 
 describe('MetricsPanel', () => {

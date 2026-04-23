@@ -149,6 +149,7 @@ func (w *Worker) run(task *Task) {
 	}
 
 	stats := model.ComputeStats(records, task.TotalPages)
+	stats.ElapsedMs = time.Since(taskStart).Milliseconds()
 
 	w.update(task.ID, func(t *Task) {
 		t.Status = StatusDone

@@ -59,9 +59,10 @@ type Stats struct {
 	TotalOutputTokens int         `json:"total_output_tokens"`
 	AvgTokensPerPage  float64     `json:"avg_tokens_per_page"`
 	MaxTokensPerCall  int         `json:"max_tokens_per_call"`
-	TotalDurationMs   int64       `json:"total_duration_ms"`
+	TotalDurationMs   int64       `json:"total_duration_ms"` // sum of all LLM call durations (inflated by parallelism)
 	P90DurationMs     int64       `json:"p90_duration_ms"`
 	P99DurationMs     int64       `json:"p99_duration_ms"`
+	ElapsedMs         int64       `json:"elapsed_ms"` // wall-clock time for the full task
 }
 
 // ComputeStats derives Stats from raw LLM records.

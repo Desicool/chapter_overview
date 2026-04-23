@@ -30,6 +30,7 @@ export interface Stats {
   total_duration_ms: number
   p90_duration_ms: number
   p99_duration_ms: number
+  elapsed_ms: number
 }
 
 export interface Task {

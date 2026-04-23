@@ -25,12 +25,7 @@ function fmtAvgTokens(n: number | undefined | null): string {
   return Math.round(n).toLocaleString()
 }
 
-export default function MetricsPanel({ stats, chapterCount }: Props) {
-  const avgDurationPerChapter =
-    stats && chapterCount > 0
-      ? stats.total_duration_ms / chapterCount
-      : undefined
-
+export default function MetricsPanel({ stats, chapterCount: _chapterCount }: Props) {
   return (
     <div className="bg-surface border border-border rounded p-5 font-mono text-sm">
       {/* Header row */}
@@ -54,11 +49,11 @@ export default function MetricsPanel({ stats, chapterCount }: Props) {
 
         {/* Timing column */}
         <div className="space-y-1.5">
-          <MetricRow label="Total" value={formatDuration(stats?.total_duration_ms)} />
-          <MetricRow label="Avg/ch" value={formatDuration(avgDurationPerChapter)} />
-          <MetricRow label="P90" value={formatDuration(stats?.p90_duration_ms)} />
+          <MetricRow label="Elapsed" value={formatDuration(stats?.elapsed_ms)} />
+          <MetricRow label="LLM sum" value={formatDuration(stats?.total_duration_ms)} footnote="②" />
+          <MetricRow label="P90/call" value={formatDuration(stats?.p90_duration_ms)} />
           <MetricRow
-            label="P99"
+            label="P99/call"
             value={formatDuration(stats?.p99_duration_ms)}
             footnote="①"
           />
@@ -69,9 +64,8 @@ export default function MetricsPanel({ stats, chapterCount }: Props) {
       <div className="border-t border-border mt-3 mb-2" />
 
       {/* Footnote */}
-      <p className="text-muted text-xs">
-        ① P99 ≈ max when N &lt; 20 LLM calls
-      </p>
+      <p className="text-muted text-xs">① P99 ≈ max when N &lt; 20 LLM calls</p>
+      <p className="text-muted text-xs">② LLM sum &gt; elapsed because calls run in parallel</p>
     </div>
   )
 }
