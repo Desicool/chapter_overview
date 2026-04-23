@@ -1,0 +1,43 @@
+# Compiled binary
+chapter-overview
+
+# Runtime data (uploaded PDFs, task storage)
+data/
+
+# Generated output
+output/
+
+# SQLite database and WAL files
+tasks.db
+tasks.db-wal
+tasks.db-shm
+
+# Environment / secrets
+.env
+.env.local
+.env.*.local
+
+# Frontend build output (rebuilt via: cd web && npm run build)
+web/dist/
+
+# Node modules
+web/node_modules/
+
+# Playwright test artifacts
+web/playwright-report/
+web/test-results/
+
+# Go build cache and test artifacts
+*.test
+*.out
+coverage.out
+
+# Claude Code local settings
+.claude/
+
+# Editor / OS
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*.swo
