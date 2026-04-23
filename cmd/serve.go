@@ -75,6 +75,7 @@ func runServe(_ *cobra.Command, _ []string) error {
 	if err != nil {
 		return fmt.Errorf("initializing provider: %w", err)
 	}
+	prov = provider.WithRetry(prov, 4)
 
 	pipelineOpts := pipeline.Options{MaxConcurrent: flagServeConcurrent}
 	_ = pipelineOpts // options are threaded through by worker

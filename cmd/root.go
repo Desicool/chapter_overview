@@ -67,6 +67,7 @@ func run(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return fmt.Errorf("initializing provider: %w", err)
 	}
+	prov = provider.WithRetry(prov, 4)
 
 	ctx := context.Background()
 	opts := pipeline.Options{MaxConcurrent: flagMaxConcurrent}

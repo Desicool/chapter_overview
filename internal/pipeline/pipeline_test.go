@@ -1,10 +1,39 @@
 package pipeline
 
 import (
+	"context"
+	"strings"
 	"testing"
 
 	"github.com/desico/chapter-overview/internal/model"
+	"github.com/desico/chapter-overview/internal/provider"
 )
+
+// ---------------------------------------------------------------------------
+// scriptedProvider: returns queued responses in order
+// ---------------------------------------------------------------------------
+
+type scriptedProvider struct {
+	responses []provider.Response
+	errs      []error
+	calls     int
+}
+
+func (s *scriptedProvider) Complete(_ context.Context, _ string) (provider.Response, error) {
+	idx := s.calls
+	s.calls++
+	if idx < len(s.errs) && s.errs[idx] != nil {
+		return provider.Response{}, s.errs[idx]
+	}
+	if idx < len(s.responses) {
+		return s.responses[idx], nil
+	}
+	return provider.Response{}, nil
+}
+
+func (s *scriptedProvider) CompleteMultimodal(ctx context.Context, p string, _ [][]byte) (provider.Response, error) {
+	return s.Complete(ctx, p)
+}
 
 // ---------------------------------------------------------------------------
 // parseBatchDetectionResponse
@@ -254,5 +283,358 @@ func TestParseJSON_InvalidJSON(t *testing.T) {
 	err := parseJSON("completely invalid", &raw)
 	if err == nil {
 		t.Error("expected error for invalid JSON, got nil")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// classifyBoundaries
+// ---------------------------------------------------------------------------
+
+func TestClassifyBoundaries_Heuristic(t *testing.T) {
+	bs := []model.ChapterBoundary{
+		{StartPage: 1, Title: "Preface"},
+		{StartPage: 3, Title: "Acknowledgements"},
+		{StartPage: 5, Title: "Chapter 1: Introduction"},
+		{StartPage: 20, Title: "Chapter 2: Methods"},
+		{StartPage: 40, Title: "Chapter 3: Results"},
+		{StartPage: 60, Title: "Bibliography"},
+		{StartPage: 65, Title: "Index"},
+	}
+	kinds := classifyBoundaries(bs)
+	want := []boundaryKind{kindFront, kindFront, kindContent, kindContent, kindContent, kindBack, kindBack}
+	for i, k := range kinds {
+		if k != want[i] {
+			t.Errorf("kinds[%d] = %q; want %q (title=%q)", i, k, want[i], bs[i].Title)
+		}
+	}
+}
+
+func TestClassifyBoundaries_PromotesFrontMatterAfterFirstChapter(t *testing.T) {
+	// "Dedication" after the first numbered chapter should be treated as content,
+	// not as front matter (unusual placement).
+	bs := []model.ChapterBoundary{
+		{StartPage: 1, Title: "Chapter 1"},
+		{StartPage: 10, Title: "Dedication"}, // late → content
+	}
+	kinds := classifyBoundaries(bs)
+	if kinds[1] != kindContent {
+		t.Errorf("late 'Dedication' kind = %q; want %q", kinds[1], kindContent)
+	}
+}
+
+func TestClassifyBoundaries_BackMatterBeforeLastChapterIsContent(t *testing.T) {
+	// "Appendix" appearing *before* the last numbered chapter is content, not back matter.
+	bs := []model.ChapterBoundary{
+		{StartPage: 1, Title: "Chapter 1"},
+		{StartPage: 10, Title: "Appendix"}, // mid-book → content
+		{StartPage: 20, Title: "Chapter 2"},
+	}
+	kinds := classifyBoundaries(bs)
+	if kinds[1] != kindContent {
+		t.Errorf("mid-book 'Appendix' kind = %q; want %q", kinds[1], kindContent)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// finalizeStructure
+// ---------------------------------------------------------------------------
+
+func TestFinalizeStructure_CollapsesFrontAndBack(t *testing.T) {
+	// 2 front + 3 content + 2 back; no budget pressure (content fits within budget).
+	bs := []model.ChapterBoundary{
+		{StartPage: 1, Title: "Preface"},
+		{StartPage: 3, Title: "Acknowledgements"},
+		{StartPage: 5, Title: "Chapter 1"},
+		{StartPage: 20, Title: "Chapter 2"},
+		{StartPage: 40, Title: "Chapter 3"},
+		{StartPage: 60, Title: "Bibliography"},
+		{StartPage: 65, Title: "Index"},
+	}
+	// Provider shouldn't be called when content count ≤ budget.
+	prov := &scriptedProvider{}
+	chapters := finalizeStructure(context.Background(), bs, 80, prov, Options{})
+
+	if len(chapters) != 5 { // 1 front + 3 content + 1 back
+		t.Fatalf("got %d chapters; want 5", len(chapters))
+	}
+	if chapters[0].Title != "Front Matter" {
+		t.Errorf("chapters[0].Title = %q; want Front Matter", chapters[0].Title)
+	}
+	if chapters[0].StartPage != 1 {
+		t.Errorf("Front Matter StartPage = %d; want 1", chapters[0].StartPage)
+	}
+	if chapters[len(chapters)-1].Title != "Back Matter" {
+		t.Errorf("last chapter title = %q; want Back Matter", chapters[len(chapters)-1].Title)
+	}
+	// Indexes 1-based & contiguous.
+	for i, ch := range chapters {
+		if ch.Index != i+1 {
+			t.Errorf("chapters[%d].Index = %d; want %d", i, ch.Index, i+1)
+		}
+	}
+	if prov.calls != 0 {
+		t.Errorf("provider calls = %d; want 0 when budget not exceeded", prov.calls)
+	}
+}
+
+func TestFinalizeStructure_BudgetMath(t *testing.T) {
+	// 2 front + 18 content + 3 back → budget = 15 - 2 (front+back) = 13 content.
+	bs := []model.ChapterBoundary{
+		{StartPage: 1, Title: "Preface"},
+		{StartPage: 3, Title: "Foreword"},
+	}
+	for i := 1; i <= 18; i++ {
+		bs = append(bs, model.ChapterBoundary{StartPage: 10 + i*5, Title: "Chapter X"})
+	}
+	bs = append(bs,
+		model.ChapterBoundary{StartPage: 200, Title: "Appendix"},
+		model.ChapterBoundary{StartPage: 210, Title: "Bibliography"},
+		model.ChapterBoundary{StartPage: 220, Title: "Index"},
+	)
+
+	// Scripted LLM returns 13 merged content boundaries.
+	mergedJSON := `[`
+	for i := 0; i < 13; i++ {
+		if i > 0 {
+			mergedJSON += ","
+		}
+		mergedJSON += `{"title":"Merged","start_page":` + itoa(15+i*10) + `}`
+	}
+	mergedJSON += `]`
+
+	prov := &scriptedProvider{
+		responses: []provider.Response{{Content: mergedJSON}},
+	}
+	chapters := finalizeStructure(context.Background(), bs, 230, prov, Options{})
+
+	if len(chapters) != 15 {
+		t.Fatalf("got %d chapters; want 15 (1 front + 13 content + 1 back)", len(chapters))
+	}
+	if chapters[0].Title != "Front Matter" {
+		t.Errorf("first = %q; want Front Matter", chapters[0].Title)
+	}
+	if chapters[14].Title != "Back Matter" {
+		t.Errorf("last = %q; want Back Matter", chapters[14].Title)
+	}
+	if prov.calls != 1 {
+		t.Errorf("provider calls = %d; want 1 (consolidate)", prov.calls)
+	}
+}
+
+func TestFinalizeStructure_EmptyBoundaries(t *testing.T) {
+	prov := &scriptedProvider{}
+	chapters := finalizeStructure(context.Background(), nil, 100, prov, Options{})
+	if len(chapters) != 1 {
+		t.Fatalf("got %d chapters; want 1 (fallback)", len(chapters))
+	}
+	if chapters[0].EndPage != 100 {
+		t.Errorf("fallback EndPage = %d; want 100", chapters[0].EndPage)
+	}
+}
+
+func TestFinalizeStructure_StripsSubsections(t *testing.T) {
+	// Numbered subsections should be dropped so parent chapter page ranges cover them.
+	bs := []model.ChapterBoundary{
+		{StartPage: 1, Title: "Chapter 1: Intro"},
+		{StartPage: 3, Title: "1.1 Background"},
+		{StartPage: 5, Title: "1.2 Motivation"},
+		{StartPage: 10, Title: "Chapter 2: Methods"},
+		{StartPage: 12, Title: "2.1 Setup"},
+		{StartPage: 20, Title: "Chapter 3: Results"},
+	}
+	chapters := finalizeStructure(context.Background(), bs, 30, &scriptedProvider{}, Options{})
+	if len(chapters) != 3 {
+		t.Fatalf("got %d chapters; want 3 (subsections stripped)", len(chapters))
+	}
+	if chapters[0].EndPage != 9 {
+		t.Errorf("Chapter 1 EndPage = %d; want 9 (covers 1.1, 1.2)", chapters[0].EndPage)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// classifyWithFallback: non-English uses LLM
+// ---------------------------------------------------------------------------
+
+func TestClassifyWithFallback_LLMUsedWhenHeuristicEmpty(t *testing.T) {
+	// Chinese titles — heuristic matches nothing → should call LLM.
+	bs := []model.ChapterBoundary{
+		{StartPage: 1, Title: "序言"},       // preface
+		{StartPage: 5, Title: "第一章 引言"},   // Chapter 1: Introduction
+		{StartPage: 20, Title: "第二章 方法"},  // Chapter 2: Methods
+		{StartPage: 40, Title: "第三章 结果"},  // Chapter 3: Results
+		{StartPage: 60, Title: "第四章 讨论"},  // Chapter 4: Discussion
+		{StartPage: 80, Title: "第五章 总结"},  // Chapter 5: Conclusion
+		{StartPage: 100, Title: "第六章 附录"}, // Chapter 6: Appendix
+		{StartPage: 120, Title: "第七章 X"},
+		{StartPage: 140, Title: "第八章 Y"},
+		{StartPage: 160, Title: "第九章 Z"},
+		{StartPage: 180, Title: "参考文献"}, // references
+		{StartPage: 190, Title: "索引"},   // index
+	}
+	llmResp := `[
+		{"kind":"front"},
+		{"kind":"content"},{"kind":"content"},{"kind":"content"},{"kind":"content"},{"kind":"content"},{"kind":"content"},{"kind":"content"},{"kind":"content"},{"kind":"content"},
+		{"kind":"back"},{"kind":"back"}
+	]`
+	prov := &scriptedProvider{responses: []provider.Response{{Content: llmResp}}}
+	kinds := classifyWithFallback(context.Background(), bs, prov, Options{})
+
+	if prov.calls != 1 {
+		t.Errorf("provider calls = %d; want 1 (LLM fallback)", prov.calls)
+	}
+	if kinds[0] != kindFront {
+		t.Errorf("kinds[0] = %q; want front", kinds[0])
+	}
+	if kinds[len(kinds)-1] != kindBack {
+		t.Errorf("last kind = %q; want back", kinds[len(kinds)-1])
+	}
+}
+
+func TestClassifyWithFallback_SkipLLMWhenHeuristicHits(t *testing.T) {
+	// English titles — heuristic finds front and back → no LLM call.
+	bs := []model.ChapterBoundary{
+		{StartPage: 1, Title: "Preface"},
+		{StartPage: 5, Title: "Chapter 1"},
+		{StartPage: 20, Title: "Chapter 2"},
+		{StartPage: 40, Title: "Chapter 3"},
+		{StartPage: 60, Title: "Chapter 4"},
+		{StartPage: 80, Title: "Chapter 5"},
+		{StartPage: 100, Title: "Chapter 6"},
+		{StartPage: 120, Title: "Chapter 7"},
+		{StartPage: 140, Title: "Chapter 8"},
+		{StartPage: 160, Title: "Chapter 9"},
+		{StartPage: 180, Title: "Index"},
+	}
+	prov := &scriptedProvider{}
+	_ = classifyWithFallback(context.Background(), bs, prov, Options{})
+	if prov.calls != 0 {
+		t.Errorf("provider calls = %d; want 0 (heuristic sufficient)", prov.calls)
+	}
+}
+
+func TestClassifyWithFallback_SkipLLMWhenListShort(t *testing.T) {
+	// Short non-English list — skip LLM (not worth the call).
+	bs := []model.ChapterBoundary{
+		{StartPage: 1, Title: "第一章"},
+		{StartPage: 20, Title: "第二章"},
+		{StartPage: 40, Title: "第三章"},
+	}
+	prov := &scriptedProvider{}
+	_ = classifyWithFallback(context.Background(), bs, prov, Options{})
+	if prov.calls != 0 {
+		t.Errorf("provider calls = %d; want 0 (short list)", prov.calls)
+	}
+}
+
+// itoa: small helper to avoid importing strconv inside test-only builder.
+func itoa(n int) string {
+	if n == 0 {
+		return "0"
+	}
+	neg := n < 0
+	if neg {
+		n = -n
+	}
+	var digits []byte
+	for n > 0 {
+		digits = append([]byte{byte('0' + n%10)}, digits...)
+		n /= 10
+	}
+	if neg {
+		return "-" + string(digits)
+	}
+	return string(digits)
+}
+
+// ---------------------------------------------------------------------------
+// looksLikeRefusal
+// ---------------------------------------------------------------------------
+
+func TestLooksLikeRefusal(t *testing.T) {
+	cases := []struct {
+		s    string
+		want bool
+	}{
+		{"I cannot access this document, please provide the content.", true},
+		{"I'm sorry, but I am unable to summarize.", true},
+		{"As an AI, I cannot...", true},
+		{"short", true},
+		{"This chapter introduces the algorithm and describes its complexity on input graphs of size N. The authors present two variants and prove correctness.", false},
+	}
+	for _, c := range cases {
+		got := looksLikeRefusal(c.s)
+		if got != c.want {
+			t.Errorf("looksLikeRefusal(%q) = %v; want %v", c.s, got, c.want)
+		}
+	}
+}
+
+// ---------------------------------------------------------------------------
+// buildFallbackSummary
+// ---------------------------------------------------------------------------
+
+func TestBuildFallbackSummary_WithText(t *testing.T) {
+	text := "This is the extracted text of a chapter. It contains multiple sentences that discuss various topics in depth. The content is long enough to be truncated beyond 150 chars total, making sure the word-boundary trim kicks in properly here."
+	summary, status := buildFallbackSummary(text)
+	if status != model.SummaryFallback {
+		t.Errorf("status = %q; want %q", status, model.SummaryFallback)
+	}
+	if !strings.Contains(summary, fallbackWarning) {
+		t.Error("summary missing warning prefix")
+	}
+	if !strings.HasSuffix(summary, "...") {
+		t.Errorf("truncated summary should end with ...; got tail %q", summary[len(summary)-10:])
+	}
+}
+
+func TestBuildFallbackSummary_EmptyText(t *testing.T) {
+	summary, status := buildFallbackSummary("   ")
+	if status != model.SummaryFailed {
+		t.Errorf("status = %q; want %q", status, model.SummaryFailed)
+	}
+	if summary != fallbackWarning {
+		t.Errorf("summary = %q; want warning only", summary)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// tryLLMSummary: refusal JSON + heuristic
+// ---------------------------------------------------------------------------
+
+func TestTryLLMSummary_RefusalJSON(t *testing.T) {
+	resp := provider.Response{
+		Content: `{"summarized": false, "summary": "", "refusal_reason": "cannot access"}`,
+	}
+	prov := &scriptedProvider{responses: []provider.Response{resp}}
+	_, _, _, ok := tryLLMSummary(context.Background(), prov, "p", nil, false)
+	if ok {
+		t.Error("expected ok=false for refusal JSON")
+	}
+}
+
+func TestTryLLMSummary_HeuristicCatchesRefusal(t *testing.T) {
+	// JSON says summarized=true but content is clearly a refusal.
+	resp := provider.Response{
+		Content: `{"summarized": true, "summary": "I cannot access the document, please provide it.", "refusal_reason": ""}`,
+	}
+	prov := &scriptedProvider{responses: []provider.Response{resp}}
+	_, _, _, ok := tryLLMSummary(context.Background(), prov, "p", nil, false)
+	if ok {
+		t.Error("expected ok=false when heuristic catches refusal phrasing")
+	}
+}
+
+func TestTryLLMSummary_ValidSummary(t *testing.T) {
+	good := "This chapter introduces the algorithm and describes its complexity on input graphs of size N. The authors present two variants and prove correctness."
+	resp := provider.Response{
+		Content: `{"summarized": true, "summary": "` + good + `", "refusal_reason": ""}`,
+	}
+	prov := &scriptedProvider{responses: []provider.Response{resp}}
+	out, _, _, ok := tryLLMSummary(context.Background(), prov, "p", nil, false)
+	if !ok {
+		t.Fatal("expected ok=true for valid summary")
+	}
+	if out != good {
+		t.Errorf("summary = %q; want %q", out, good)
 	}
 }

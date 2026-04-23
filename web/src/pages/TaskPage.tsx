@@ -230,14 +230,14 @@ function ChapterRow({ chapter, taskId, index }: ChapterRowProps) {
       {/* Ch. N badge */}
       <td className="py-3 pr-4">
         <span className="font-mono text-xs text-amber tracking-widest">
-          Ch.&nbsp;{chapter.index + 1}
+          Ch.&nbsp;{chapter.index}
         </span>
       </td>
 
       {/* Title */}
       <td className="py-3 pr-4 max-w-[10rem]">
         <span className="font-serif text-sm text-text leading-snug line-clamp-2">
-          {chapter.title || `Chapter ${chapter.index + 1}`}
+          {chapter.title || `Chapter ${chapter.index}`}
         </span>
       </td>
 
@@ -251,9 +251,19 @@ function ChapterRow({ chapter, taskId, index }: ChapterRowProps) {
       {/* Summary */}
       <td className="py-3 pr-4">
         {hasSummary ? (
-          <p className="text-sm text-text/80 leading-relaxed animate-[fadeIn_0.4s_ease]">
-            {chapter.summary}
-          </p>
+          chapter.summary_status === 'fallback' || chapter.summary_status === 'failed' ? (
+            <div
+              role="note"
+              className="text-sm text-amber/90 leading-relaxed border-l-2 border-amber/60 pl-3 animate-[fadeIn_0.4s_ease] whitespace-pre-line"
+            >
+              <span aria-hidden="true" className="mr-1">⚠</span>
+              {chapter.summary}
+            </div>
+          ) : (
+            <p className="text-sm text-text/80 leading-relaxed animate-[fadeIn_0.4s_ease]">
+              {chapter.summary}
+            </p>
+          )
         ) : (
           <div className="space-y-2 py-1">
             <div className="shimmer h-3 rounded w-full" />

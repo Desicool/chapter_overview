@@ -108,6 +108,7 @@ func (w *Worker) run(task *Task) {
 					for i := range t.Chapters {
 						if t.Chapters[i].Index == e.ChapterIndex {
 							t.Chapters[i].Summary = e.Chapter.Summary
+							t.Chapters[i].SummaryStatus = e.Chapter.SummaryStatus
 						}
 					}
 				})

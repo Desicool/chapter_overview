@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strings"
 	"sync"
@@ -98,17 +99,19 @@ func SummarizeChapters(ctx context.Context, pdfPath string, chapters []model.Cha
 			defer func() { <-sem }()
 
 			ch := &chapters[idx]
-			summary, err := summarizeChapter(ctx, pdfPath, *ch, prov, opts)
+			summary, status, err := summarizeChapter(ctx, pdfPath, *ch, prov, opts)
 			mu.Lock()
 			defer mu.Unlock()
 			if err != nil {
 				if firstErr == nil {
 					firstErr = fmt.Errorf("chapter %d %q: %w", ch.Index, ch.Title, err)
 				}
-				ch.Summary = "[summarization failed]"
+				ch.Summary = fallbackWarning
+				ch.SummaryStatus = model.SummaryFailed
 				return
 			}
 			ch.Summary = summary
+			ch.SummaryStatus = status
 		}(i)
 	}
 	wg.Wait()
@@ -120,49 +123,11 @@ func SummarizeChapters(ctx context.Context, pdfPath string, chapters []model.Cha
 	return chapters, nil
 }
 
-// validateTOC sends the TOC to the LLM to validate, correct, and merge to ≤15 chapters.
+// validateTOC classifies and finalizes a raw TOC into ≤maxChapters chapters.
+// Front matter collapses to one boundary; back matter collapses to one boundary;
+// remaining content titles are LLM-merged into the remaining budget if needed.
 func validateTOC(ctx context.Context, _ string, toc []model.ChapterBoundary, totalPages int, prov provider.Provider, opts Options) ([]model.Chapter, error) {
-	// Build TOC text for the LLM
-	var sb strings.Builder
-	sb.WriteString("Here is the table of contents extracted from a PDF:\n\n")
-	for _, b := range toc {
-		sb.WriteString(fmt.Sprintf("Page %d: %s\n", b.StartPage, b.Title))
-	}
-	sb.WriteString(fmt.Sprintf("\nTotal pages: %d\n", totalPages))
-	sb.WriteString(fmt.Sprintf(`
-Your task: validate and clean up these TOC entries into logical chapters.
-Rules:
-1. Merge only numbered sub-sections (e.g. "1.1 Introduction", "2.3 Examples") into their parent chapter.
-2. If there are still more than %d chapters, reduce by merging in this priority order:
-   a. First: merge front matter (preface, acknowledgements, title pages) into the first content chapter.
-   b. Second: merge back matter (index, bibliography, appendix entries) together.
-   c. Last resort only: merge the two shortest consecutive numbered chapters.
-   Never merge two substantial numbered content chapters unless unavoidable.
-3. Every chapter must have a start_page and end_page.
-4. The last chapter's end_page should be the total page count.
-
-Respond ONLY with a JSON array, no extra text:
-[{"title":"Chapter Title","start_page":1,"end_page":50}, ...]`, maxChapters))
-
-	start := time.Now()
-	result, err := prov.Complete(ctx, sb.String())
-	durationMs := time.Since(start).Milliseconds()
-	if err != nil {
-		return nil, fmt.Errorf("LLM TOC validation: %w", err)
-	}
-
-	opts.emit(ProgressEvent{
-		Type:       EventDetecting,
-		Usage:      result.Usage,
-		DurationMs: durationMs,
-	})
-
-	chapters, err := parseChapterJSON(result.Content, totalPages)
-	if err != nil {
-		// Fallback: convert raw TOC entries directly
-		return tocToChapters(toc, totalPages), nil
-	}
-	return chapters, nil
+	return finalizeStructure(ctx, toc, totalPages, prov, opts), nil
 }
 
 const pagesBatchSize = 10 // pages per LLM batch during detection
@@ -249,19 +214,15 @@ func scanPagesForChapters(ctx context.Context, pdfPath string, totalPages int, p
 		boundaries = []model.ChapterBoundary{{StartPage: 1, Title: filepath.Base(pdfPath)}}
 	}
 
-	// Merge if > maxChapters
-	if len(boundaries) > maxChapters {
-		boundaries, _ = mergeChaptersViaLLM(ctx, boundaries, totalPages, prov)
-	}
-
-	return tocToChapters(boundaries, totalPages), nil
+	return finalizeStructure(ctx, boundaries, totalPages, prov, opts), nil
 }
 
-// summarizeChapter sends all pages of a chapter to the LLM for summarization.
-func summarizeChapter(ctx context.Context, pdfPath string, ch model.Chapter, prov provider.Provider, opts Options) (string, error) {
+// summarizeChapter sends all pages of a chapter to the LLM for summarization,
+// validates the response, and falls back to text extraction if the LLM refuses.
+func summarizeChapter(ctx context.Context, pdfPath string, ch model.Chapter, prov provider.Provider, opts Options) (string, model.SummaryStatus, error) {
 	pages, err := pdf.ExtractPagesRange(pdfPath, ch.StartPage, ch.EndPage)
 	if err != nil {
-		return "", err
+		return "", model.SummaryFailed, err
 	}
 
 	var textParts []string
@@ -284,80 +245,426 @@ func summarizeChapter(ctx context.Context, pdfPath string, ch model.Chapter, pro
 		fullText = fullText[:24000] + "\n[...content truncated for length...]"
 	}
 
-	prompt := fmt.Sprintf(
-		"Summarize the following chapter from a PDF document.\n\nChapter: %s (pages %d–%d)\n\n%s\n\nProvide a concise, informative summary in 3–5 sentences.",
-		ch.Title, ch.StartPage, ch.EndPage, fullText,
-	)
+	basePrompt := buildSummaryPrompt(ch, fullText)
 
-	var llmResult provider.Response
-	start := time.Now()
-	if hasImages && len(allImages) > 0 {
-		// Cap images to avoid huge payloads
-		if len(allImages) > 5 {
-			allImages = allImages[:5]
-		}
-		llmResult, err = prov.CompleteMultimodal(ctx, prompt, allImages)
-	} else {
-		llmResult, err = prov.Complete(ctx, prompt)
+	// First attempt
+	summary, totalUsage, totalMs, ok := tryLLMSummary(ctx, prov, basePrompt, allImages, hasImages)
+	if !ok {
+		// One corrective re-prompt: may catch format errors or soft refusals.
+		retryPrompt := basePrompt + "\n\nYour previous response was not valid JSON or was a refusal. Respond again with ONLY the JSON object. Do not include any other text."
+		var retryUsage provider.Usage
+		var retryMs int64
+		summary, retryUsage, retryMs, ok = tryLLMSummary(ctx, prov, retryPrompt, allImages, hasImages)
+		totalUsage.InputTokens += retryUsage.InputTokens
+		totalUsage.OutputTokens += retryUsage.OutputTokens
+		totalMs += retryMs
 	}
-	durationMs := time.Since(start).Milliseconds()
-	if err != nil {
-		return "", err
+
+	status := model.SummaryOK
+	if !ok {
+		summary, status = buildFallbackSummary(fullText)
 	}
 
 	opts.emit(ProgressEvent{
 		Type:         EventChapterDone,
 		ChapterIndex: ch.Index,
 		Chapter: &model.Chapter{
-			Index:     ch.Index,
-			Title:     ch.Title,
-			StartPage: ch.StartPage,
-			EndPage:   ch.EndPage,
-			Summary:   llmResult.Content,
+			Index:         ch.Index,
+			Title:         ch.Title,
+			StartPage:     ch.StartPage,
+			EndPage:       ch.EndPage,
+			Summary:       summary,
+			SummaryStatus: status,
 		},
-		Usage:      llmResult.Usage,
+		Usage:      totalUsage,
+		DurationMs: totalMs,
+	})
+
+	return summary, status, nil
+}
+
+// buildSummaryPrompt builds the structured-JSON summary prompt.
+func buildSummaryPrompt(ch model.Chapter, text string) string {
+	return fmt.Sprintf(`Summarize the following chapter from a PDF document.
+
+Chapter: %s (pages %d–%d)
+
+%s
+
+Respond ONLY with a JSON object, no extra text:
+{
+  "summarized": true,
+  "summary": "3-5 sentence informative summary",
+  "refusal_reason": ""
+}
+
+If you cannot summarize (content unreadable, access issues, policy refusal),
+set "summarized": false, leave "summary": "", and put the reason in "refusal_reason".`,
+		ch.Title, ch.StartPage, ch.EndPage, text,
+	)
+}
+
+// tryLLMSummary makes one LLM call and validates the response.
+// Returns (summary, usage, durationMs, ok). ok=false means refusal/invalid/heuristic-tripped.
+func tryLLMSummary(ctx context.Context, prov provider.Provider, prompt string, images [][]byte, hasImages bool) (string, provider.Usage, int64, bool) {
+	var llmResult provider.Response
+	var err error
+	start := time.Now()
+	if hasImages && len(images) > 0 {
+		capped := images
+		if len(capped) > 5 {
+			capped = capped[:5]
+		}
+		llmResult, err = prov.CompleteMultimodal(ctx, prompt, capped)
+	} else {
+		llmResult, err = prov.Complete(ctx, prompt)
+	}
+	durationMs := time.Since(start).Milliseconds()
+	if err != nil {
+		return "", provider.Usage{}, durationMs, false
+	}
+
+	var parsed struct {
+		Summarized    bool   `json:"summarized"`
+		Summary       string `json:"summary"`
+		RefusalReason string `json:"refusal_reason"`
+	}
+	if err := parseJSON(llmResult.Content, &parsed); err != nil {
+		return "", llmResult.Usage, durationMs, false
+	}
+	if !parsed.Summarized {
+		return "", llmResult.Usage, durationMs, false
+	}
+	if looksLikeRefusal(parsed.Summary) {
+		return "", llmResult.Usage, durationMs, false
+	}
+	return strings.TrimSpace(parsed.Summary), llmResult.Usage, durationMs, true
+}
+
+// refusalPhrases are substrings that indicate an LLM refusal masquerading as a summary.
+var refusalPhrases = []string{
+	"cannot access",
+	"can't access",
+	"unable to access",
+	"i don't have access",
+	"i do not have access",
+	"no content provided",
+	"as an ai",
+	"i'm sorry",
+	"i am sorry",
+	"i cannot",
+}
+
+// looksLikeRefusal returns true if the text is too short or contains refusal phrases.
+func looksLikeRefusal(s string) bool {
+	s = strings.TrimSpace(s)
+	if len(s) < 40 {
+		return true
+	}
+	lower := strings.ToLower(s)
+	for _, p := range refusalPhrases {
+		if strings.Contains(lower, p) {
+			return true
+		}
+	}
+	return false
+}
+
+const fallbackWarning = "[warning: may contain inappropriate content, LLM could not summarize]"
+const fallbackTextLimit = 150
+
+// buildFallbackSummary returns a warning-prefixed excerpt of the extracted text.
+// If the text is empty, returns the warning alone with SummaryFailed.
+func buildFallbackSummary(fullText string) (string, model.SummaryStatus) {
+	trimmed := strings.TrimSpace(fullText)
+	if trimmed == "" {
+		return fallbackWarning, model.SummaryFailed
+	}
+	excerpt := trimmed
+	if len(excerpt) > fallbackTextLimit {
+		excerpt = excerpt[:fallbackTextLimit]
+		// try to truncate at a word boundary
+		if idx := strings.LastIndexAny(excerpt, " \n\t"); idx > fallbackTextLimit/2 {
+			excerpt = excerpt[:idx]
+		}
+		excerpt = strings.TrimRight(excerpt, " \n\t.,;:") + "..."
+	}
+	return fallbackWarning + "\n\n" + excerpt, model.SummaryFallback
+}
+
+// kind labels a chapter boundary as front matter, content, or back matter.
+type boundaryKind string
+
+const (
+	kindFront   boundaryKind = "front"
+	kindContent boundaryKind = "content"
+	kindBack    boundaryKind = "back"
+)
+
+var (
+	// Front matter: non-content sections before chapter 1.
+	// Patterns are prefixes; no trailing \b so e.g. "Acknowledgements" matches "acknowledg".
+	frontMatterRE = regexp.MustCompile(`(?i)^\s*(preface|foreword|acknowledg|title\s*page|copyright|dedication|(table\s*of\s*)?contents|about\s+(the|this)\s+book|prologue|abstract)`)
+	// Back matter: non-content sections after the last chapter.
+	backMatterRE = regexp.MustCompile(`(?i)^\s*(index|bibliograph|references|appendi|glossar|about\s+the\s+author|endnotes|notes|colophon|epilogue|afterword)`)
+	// Numbered-chapter pattern used to promote a "Chapter 1"/"1 " title as the first content chapter.
+	numberedChapterRE = regexp.MustCompile(`(?i)^\s*(chapter\s+\d+|part\s+[IVX0-9]+|\d+[\.\s])`)
+	// Subsection pattern: "1.1", "2.3.1", "1.1 Intro", "1.1.1.1"… Anything with two or more dotted numbers at the start.
+	subsectionRE = regexp.MustCompile(`^\s*\d+\.\d+`)
+)
+
+// stripSubsections drops TOC entries that look like numbered subsections
+// ("1.1 Foo", "2.3.1 Bar"). Their parent chapter's page range naturally
+// covers them since the next top-level boundary marks the end.
+func stripSubsections(boundaries []model.ChapterBoundary) []model.ChapterBoundary {
+	out := make([]model.ChapterBoundary, 0, len(boundaries))
+	for _, b := range boundaries {
+		if subsectionRE.MatchString(b.Title) {
+			continue
+		}
+		out = append(out, b)
+	}
+	return out
+}
+
+// classifyBoundary classifies a single title by heuristic.
+func classifyBoundary(title string) boundaryKind {
+	switch {
+	case frontMatterRE.MatchString(title):
+		return kindFront
+	case backMatterRE.MatchString(title):
+		return kindBack
+	default:
+		return kindContent
+	}
+}
+
+// classifyBoundaries tags every boundary as front/content/back using the heuristic.
+// Ordering matters: once we hit the first "content" boundary, later front-matter-looking
+// titles are treated as content (e.g., a chapter titled "Dedication" mid-book).
+// Once we've seen the last numbered content chapter, back-matter-looking titles are honored;
+// before then they're treated as content.
+func classifyBoundaries(boundaries []model.ChapterBoundary) []boundaryKind {
+	kinds := make([]boundaryKind, len(boundaries))
+	firstContentIdx := -1
+	lastNumberedIdx := -1
+	for i, b := range boundaries {
+		if numberedChapterRE.MatchString(b.Title) {
+			if firstContentIdx == -1 {
+				firstContentIdx = i
+			}
+			lastNumberedIdx = i
+		}
+	}
+	for i, b := range boundaries {
+		k := classifyBoundary(b.Title)
+		switch k {
+		case kindFront:
+			if firstContentIdx != -1 && i > firstContentIdx {
+				k = kindContent
+			}
+		case kindBack:
+			if lastNumberedIdx != -1 && i < lastNumberedIdx {
+				k = kindContent
+			}
+		}
+		kinds[i] = k
+	}
+	return kinds
+}
+
+// classifyBoundariesWithLLM falls back to the LLM when the heuristic produces
+// zero front and zero back labels for a sufficiently long list (likely non-English).
+// Returns the original kinds unchanged if the LLM call fails or returns garbage.
+func classifyBoundariesWithLLM(ctx context.Context, boundaries []model.ChapterBoundary, kinds []boundaryKind, prov provider.Provider, opts Options) []boundaryKind {
+	var sb strings.Builder
+	sb.WriteString("For each of the following PDF table-of-contents entries, classify as front matter, content, or back matter.\n")
+	sb.WriteString("Front matter = preface, dedication, acknowledgements, contents, copyright, etc. Back matter = index, bibliography, appendix, glossary, references, etc. Everything else = content.\n\n")
+	for i, b := range boundaries {
+		fmt.Fprintf(&sb, "%d. (page %d) %s\n", i+1, b.StartPage, b.Title)
+	}
+	sb.WriteString(`
+Respond ONLY with a JSON array with one object per entry, in the same order:
+[{"kind":"front"},{"kind":"content"},{"kind":"back"}, ...]
+Valid values for "kind" are exactly: "front", "content", "back".`)
+
+	start := time.Now()
+	result, err := prov.Complete(ctx, sb.String())
+	durationMs := time.Since(start).Milliseconds()
+	if err != nil {
+		return kinds
+	}
+	opts.emit(ProgressEvent{
+		Type:       EventDetecting,
+		Usage:      result.Usage,
 		DurationMs: durationMs,
 	})
 
-	return llmResult.Content, nil
+	var raw []struct {
+		Kind string `json:"kind"`
+	}
+	if err := parseJSON(result.Content, &raw); err != nil {
+		return kinds
+	}
+	if len(raw) != len(boundaries) {
+		return kinds
+	}
+	out := make([]boundaryKind, len(boundaries))
+	for i, r := range raw {
+		switch strings.ToLower(strings.TrimSpace(r.Kind)) {
+		case "front":
+			out[i] = kindFront
+		case "back":
+			out[i] = kindBack
+		default:
+			out[i] = kindContent
+		}
+	}
+	return out
 }
 
-// mergeChaptersViaLLM asks the LLM to merge a long list of chapters into ≤15.
-func mergeChaptersViaLLM(ctx context.Context, boundaries []model.ChapterBoundary, totalPages int, prov provider.Provider) ([]model.ChapterBoundary, error) {
+// classifyWithFallback runs heuristic classification; if the heuristic finds
+// zero front and zero back labels among a long list (likely non-English), it
+// consults the LLM.
+func classifyWithFallback(ctx context.Context, boundaries []model.ChapterBoundary, prov provider.Provider, opts Options) []boundaryKind {
+	kinds := classifyBoundaries(boundaries)
+	if len(boundaries) <= 10 {
+		return kinds
+	}
+	hasFront, hasBack := false, false
+	for _, k := range kinds {
+		if k == kindFront {
+			hasFront = true
+		}
+		if k == kindBack {
+			hasBack = true
+		}
+	}
+	if hasFront || hasBack {
+		return kinds
+	}
+	return classifyBoundariesWithLLM(ctx, boundaries, kinds, prov, opts)
+}
+
+// finalizeStructure classifies boundaries, collapses front/back matter into one
+// bucket each, and budget-merges content titles via LLM if they exceed the remaining
+// slots. Always returns re-indexed chapters with start/end pages computed.
+func finalizeStructure(ctx context.Context, boundaries []model.ChapterBoundary, totalPages int, prov provider.Provider, opts Options) []model.Chapter {
+	if len(boundaries) == 0 {
+		return []model.Chapter{{Index: 1, Title: "Document", StartPage: 1, EndPage: totalPages}}
+	}
+
+	// Sort by page so classification + collapsing are deterministic.
+	sort.Slice(boundaries, func(i, j int) bool {
+		return boundaries[i].StartPage < boundaries[j].StartPage
+	})
+
+	// Drop numbered subsections ("1.1", "2.3.1", …); parent chapter page ranges cover them.
+	boundaries = stripSubsections(boundaries)
+	if len(boundaries) == 0 {
+		return []model.Chapter{{Index: 1, Title: "Document", StartPage: 1, EndPage: totalPages}}
+	}
+
+	kinds := classifyWithFallback(ctx, boundaries, prov, opts)
+
+	var front, content, back []model.ChapterBoundary
+	for i, b := range boundaries {
+		switch kinds[i] {
+		case kindFront:
+			front = append(front, b)
+		case kindBack:
+			back = append(back, b)
+		default:
+			content = append(content, b)
+		}
+	}
+
+	// Budget: the remaining slots for content titles after reserving front/back.
+	budget := maxChapters
+	if len(front) > 0 {
+		budget--
+	}
+	if len(back) > 0 {
+		budget--
+	}
+	if budget < 1 {
+		budget = 1
+	}
+
+	if len(content) > budget {
+		merged := consolidateContentViaLLM(ctx, content, budget, prov, opts)
+		if len(merged) > 0 {
+			content = merged
+		} else {
+			content = sampleBoundaries(content, budget)
+		}
+	}
+
+	// Stitch: [front-bucket] + content + [back-bucket]
+	stitched := make([]model.ChapterBoundary, 0, len(content)+2)
+	if len(front) > 0 {
+		stitched = append(stitched, model.ChapterBoundary{
+			StartPage: front[0].StartPage,
+			Title:     "Front Matter",
+		})
+	}
+	stitched = append(stitched, content...)
+	if len(back) > 0 {
+		stitched = append(stitched, model.ChapterBoundary{
+			StartPage: back[0].StartPage,
+			Title:     "Back Matter",
+		})
+	}
+
+	return tocToChapters(stitched, totalPages)
+}
+
+// consolidateContentViaLLM asks the LLM to reduce a list of content-only chapter
+// titles to a target count by merging the shortest consecutive pairs.
+// Returns an empty slice on error so the caller can fall back to sampling.
+func consolidateContentViaLLM(ctx context.Context, content []model.ChapterBoundary, budget int, prov provider.Provider, opts Options) []model.ChapterBoundary {
 	var sb strings.Builder
-	sb.WriteString(fmt.Sprintf("A PDF with %d pages has %d detected chapter starts:\n\n", totalPages, len(boundaries)))
-	for _, b := range boundaries {
-		sb.WriteString(fmt.Sprintf("Page %d: %s\n", b.StartPage, b.Title))
+	fmt.Fprintf(&sb, "A book has %d content chapters (front/back matter already handled):\n\n", len(content))
+	for _, b := range content {
+		fmt.Fprintf(&sb, "Page %d: %s\n", b.StartPage, b.Title)
 	}
-	sb.WriteString(fmt.Sprintf(`
-Reduce these chapter starts to at most %d by merging in priority order:
-1. Merge front matter (preface, acknowledgements, title pages) into the first content chapter.
-2. Merge back matter (index, bibliography, appendix entries) together.
-3. Last resort: merge the two shortest consecutive chapters.
-Never merge two substantial numbered content chapters unless unavoidable.
-Respond ONLY with a JSON array:
-[{"title":"Group Title","start_page":1}, ...]`, maxChapters))
+	fmt.Fprintf(&sb, `
+Reduce these content chapters to exactly %d by merging consecutive chapters.
+Rules:
+- Merge the two shortest consecutive chapters first; repeat until count = %d.
+- Never merge two substantial numbered chapters unless unavoidable.
+- Preserve original chapter order.
+- The merged title should describe both original chapters (e.g., "Chapters 3-4: Foundations").
 
+Respond ONLY with a JSON array, no extra text:
+[{"title":"Merged Title","start_page":1}, ...]`, budget, budget)
+
+	start := time.Now()
 	result, err := prov.Complete(ctx, sb.String())
+	durationMs := time.Since(start).Milliseconds()
 	if err != nil {
-		// Fallback: evenly subsample
-		return sampleBoundaries(boundaries, maxChapters), nil
+		return nil
 	}
+	opts.emit(ProgressEvent{
+		Type:       EventDetecting,
+		Usage:      result.Usage,
+		DurationMs: durationMs,
+	})
 
-	// Parse simplified JSON (no end_page needed here)
 	var raw []struct {
 		Title     string `json:"title"`
 		StartPage int    `json:"start_page"`
 	}
 	if err := parseJSON(result.Content, &raw); err != nil {
-		return sampleBoundaries(boundaries, maxChapters), nil
+		return nil
 	}
-
 	merged := make([]model.ChapterBoundary, 0, len(raw))
 	for _, r := range raw {
-		merged = append(merged, model.ChapterBoundary{StartPage: r.StartPage, Title: r.Title})
+		if r.StartPage > 0 && r.Title != "" {
+			merged = append(merged, model.ChapterBoundary{StartPage: r.StartPage, Title: r.Title})
+		}
 	}
-	return merged, nil
+	return merged
 }
 
 // buildBatchDetectionPrompt creates a prompt for detecting chapter starts across multiple pages.

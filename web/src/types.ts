@@ -1,11 +1,14 @@
 export type Status = 'pending' | 'detecting' | 'summarizing' | 'done' | 'failed'
 
+export type SummaryStatus = 'ok' | 'fallback' | 'failed'
+
 export interface Chapter {
   index: number
   title: string
   start_page: number
   end_page: number
   summary: string
+  summary_status?: SummaryStatus
 }
 
 export interface LLMRecord {

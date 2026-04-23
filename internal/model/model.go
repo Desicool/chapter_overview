@@ -14,13 +14,24 @@ type ChapterBoundary struct {
 	Title     string
 }
 
+// SummaryStatus describes the quality/origin of a chapter summary.
+type SummaryStatus string
+
+const (
+	SummaryOK       SummaryStatus = "ok"       // LLM produced a valid summary
+	SummaryFallback SummaryStatus = "fallback" // LLM refused/failed; summary contains warning + raw text
+	SummaryFailed   SummaryStatus = "failed"   // LLM refused AND text extraction yielded nothing
+	SummaryPending  SummaryStatus = ""         // not yet summarized
+)
+
 // Chapter is a detected chapter with its summary.
 type Chapter struct {
-	Index     int    `json:"index"`
-	Title     string `json:"title"`
-	StartPage int    `json:"start_page"`
-	EndPage   int    `json:"end_page"`
-	Summary   string `json:"summary"`
+	Index         int           `json:"index"`
+	Title         string        `json:"title"`
+	StartPage     int           `json:"start_page"`
+	EndPage       int           `json:"end_page"`
+	Summary       string        `json:"summary"`
+	SummaryStatus SummaryStatus `json:"summary_status,omitempty"`
 }
 
 // Result is the final JSON output.
