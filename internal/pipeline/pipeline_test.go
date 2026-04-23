@@ -31,6 +31,10 @@ func (s *scriptedProvider) Complete(_ context.Context, _ string) (provider.Respo
 	return provider.Response{}, nil
 }
 
+func (s *scriptedProvider) CompleteJSON(ctx context.Context, p string) (provider.Response, error) {
+	return s.Complete(ctx, p)
+}
+
 func (s *scriptedProvider) CompleteMultimodal(ctx context.Context, p string, _ [][]byte) (provider.Response, error) {
 	return s.Complete(ctx, p)
 }

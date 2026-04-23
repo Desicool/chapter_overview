@@ -11,13 +11,15 @@ import (
 )
 
 const (
-	kimiBaseURL       = "https://api.moonshot.cn/v1"
-	kimiDefaultText   = "moonshot-v1-32k"
-	kimiDefaultVision = "moonshot-v1-32k-vision-preview"
+	kimiBaseURL        = "https://api.moonshot.cn/v1"
+	kimiDefaultText    = "moonshot-v1-32k"
+	kimiDefaultVision  = "moonshot-v1-32k-vision-preview"
+	kimiDefaultDetect  = "moonshot-v1-8k"
 )
 
 type kimiProvider struct {
 	client      *openai.Client
+	detectModel string
 	textModel   string
 	visionModel string
 }
@@ -31,6 +33,10 @@ func newKimi(cfg Config) (Provider, error) {
 	conf := openai.DefaultConfig(apiKey)
 	conf.BaseURL = kimiBaseURL
 
+	detectModel := cfg.DetectModel
+	if detectModel == "" {
+		detectModel = kimiDefaultDetect
+	}
 	textModel := cfg.TextModel
 	if textModel == "" {
 		textModel = kimiDefaultText
@@ -42,6 +48,7 @@ func newKimi(cfg Config) (Provider, error) {
 
 	return &kimiProvider{
 		client:      openai.NewClientWithConfig(conf),
+		detectModel: detectModel,
 		textModel:   textModel,
 		visionModel: visionModel,
 	}, nil
@@ -51,7 +58,7 @@ func init() {
 	Register("kimi", newKimi)
 }
 
-// Complete sends a text-only prompt.
+// Complete sends a text-only prompt using the summarization model.
 func (k *kimiProvider) Complete(ctx context.Context, prompt string) (Response, error) {
 	resp, err := k.client.CreateChatCompletion(ctx, openai.ChatCompletionRequest{
 		Model: k.textModel,
@@ -64,6 +71,32 @@ func (k *kimiProvider) Complete(ctx context.Context, prompt string) (Response, e
 	}
 	if len(resp.Choices) == 0 {
 		return Response{}, errors.New("kimi complete: empty response")
+	}
+	return Response{
+		Content: resp.Choices[0].Message.Content,
+		Usage: Usage{
+			InputTokens:  resp.Usage.PromptTokens,
+			OutputTokens: resp.Usage.CompletionTokens,
+		},
+	}, nil
+}
+
+// CompleteJSON sends a prompt using the detection model with forced JSON output.
+func (k *kimiProvider) CompleteJSON(ctx context.Context, prompt string) (Response, error) {
+	resp, err := k.client.CreateChatCompletion(ctx, openai.ChatCompletionRequest{
+		Model: k.detectModel,
+		Messages: []openai.ChatCompletionMessage{
+			{Role: openai.ChatMessageRoleUser, Content: prompt},
+		},
+		ResponseFormat: &openai.ChatCompletionResponseFormat{
+			Type: openai.ChatCompletionResponseFormatTypeJSONObject,
+		},
+	})
+	if err != nil {
+		return Response{}, fmt.Errorf("kimi complete-json: %w", err)
+	}
+	if len(resp.Choices) == 0 {
+		return Response{}, errors.New("kimi complete-json: empty response")
 	}
 	return Response{
 		Content: resp.Choices[0].Message.Content,

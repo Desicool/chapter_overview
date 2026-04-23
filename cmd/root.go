@@ -20,6 +20,7 @@ var (
 	flagProvider      string
 	flagTextModel     string
 	flagVisionModel   string
+	flagDetectModel   string
 	flagOutputDir     string
 	flagMaxConcurrent int
 	flagSplitPDF      bool
@@ -41,10 +42,11 @@ func Execute() {
 
 func init() {
 	rootCmd.Flags().StringVar(&flagProvider, "provider", "kimi", "LLM provider (kimi)")
-	rootCmd.Flags().StringVar(&flagTextModel, "text-model", "", "Text model override (default: provider default)")
-	rootCmd.Flags().StringVar(&flagVisionModel, "vision-model", "", "Vision model override (default: provider default)")
+	rootCmd.Flags().StringVar(&flagTextModel, "text-model", "", "Summarization model override (default: moonshot-v1-32k)")
+	rootCmd.Flags().StringVar(&flagVisionModel, "vision-model", "", "Vision model override (default: moonshot-v1-32k-vision-preview)")
 	rootCmd.Flags().StringVar(&flagOutputDir, "output-dir", "./output", "Output directory")
-	rootCmd.Flags().IntVar(&flagMaxConcurrent, "max-concurrent", 5, "Max parallel LLM calls")
+	rootCmd.Flags().IntVar(&flagMaxConcurrent, "max-concurrent", 50, "Max parallel LLM calls")
+	rootCmd.Flags().StringVar(&flagDetectModel, "detect-model", "", "Detection model override (default: moonshot-v1-8k)")
 	rootCmd.Flags().BoolVar(&flagSplitPDF, "split-pdf", false, "Also output per-chapter PDF files")
 	rootCmd.Flags().IntVar(&flagMaxChapters, "max-chapters", 0, "Limit summarization to first N chapters (0 = all)")
 }
@@ -63,6 +65,7 @@ func run(cmd *cobra.Command, args []string) error {
 	prov, err := provider.Get(flagProvider, provider.Config{
 		TextModel:   flagTextModel,
 		VisionModel: flagVisionModel,
+		DetectModel: flagDetectModel,
 	})
 	if err != nil {
 		return fmt.Errorf("initializing provider: %w", err)

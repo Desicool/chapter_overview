@@ -35,6 +35,10 @@ func (r *retryProvider) Complete(ctx context.Context, prompt string) (Response, 
 	return r.do(ctx, func() (Response, error) { return r.inner.Complete(ctx, prompt) })
 }
 
+func (r *retryProvider) CompleteJSON(ctx context.Context, prompt string) (Response, error) {
+	return r.do(ctx, func() (Response, error) { return r.inner.CompleteJSON(ctx, prompt) })
+}
+
 func (r *retryProvider) CompleteMultimodal(ctx context.Context, prompt string, images [][]byte) (Response, error) {
 	return r.do(ctx, func() (Response, error) { return r.inner.CompleteMultimodal(ctx, prompt, images) })
 }

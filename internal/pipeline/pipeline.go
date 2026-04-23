@@ -16,7 +16,11 @@ import (
 	"github.com/desico/chapter-overview/internal/provider"
 )
 
-const maxChapters = 15
+const (
+	maxChapters     = 15
+	pagesBatchSize  = 15    // pages per LLM batch; safe for moonshot-v1-8k with dense/CJK content
+	maxChapterChars = 80000 // ~20k tokens; fits comfortably in moonshot-v1-32k
+)
 
 // EventType classifies a pipeline progress event.
 type EventType string
@@ -44,12 +48,15 @@ type ProgressEvent struct {
 // Options controls pipeline behavior.
 type Options struct {
 	MaxConcurrent int
-	OnProgress    func(ProgressEvent) // nil = no-op
+	OnProgress    func(ProgressEvent)
+	// PageLoader overrides the default pdf.ExtractPagesRange for page content retrieval.
+	// Set to a *pdf.PageCache.GetRange to share extracted pages across detect and summarize.
+	PageLoader func(pdfPath string, start, end int) ([]model.PageContent, error)
 }
 
 func (o Options) concurrency() int {
 	if o.MaxConcurrent <= 0 {
-		return 5
+		return 50
 	}
 	return o.MaxConcurrent
 }
@@ -58,6 +65,13 @@ func (o Options) emit(e ProgressEvent) {
 	if o.OnProgress != nil {
 		o.OnProgress(e)
 	}
+}
+
+func (o Options) loadPages(pdfPath string, start, end int) ([]model.PageContent, error) {
+	if o.PageLoader != nil {
+		return o.PageLoader(pdfPath, start, end)
+	}
+	return pdf.ExtractPagesRange(pdfPath, start, end)
 }
 
 // DetectChapters finds chapter boundaries in the PDF.
@@ -117,7 +131,6 @@ func SummarizeChapters(ctx context.Context, pdfPath string, chapters []model.Cha
 	wg.Wait()
 
 	if firstErr != nil {
-		// Non-fatal: return partial results with error
 		fmt.Printf("[warn] summarization had errors: %v\n", firstErr)
 	}
 	return chapters, nil
@@ -130,16 +143,14 @@ func validateTOC(ctx context.Context, _ string, toc []model.ChapterBoundary, tot
 	return finalizeStructure(ctx, toc, totalPages, prov, opts), nil
 }
 
-const pagesBatchSize = 10 // pages per LLM batch during detection
-
 // scanPagesForChapters analyzes pages in batches to detect chapter starts.
-// Sends pagesBatchSize pages of text per LLM call to minimize API round-trips.
+// Uses pagesBatchSize pages per LLM call to minimize API round-trips while
+// fitting within the detection model's context window.
 func scanPagesForChapters(ctx context.Context, pdfPath string, totalPages int, prov provider.Provider, opts Options) ([]model.Chapter, error) {
 	type batchResult struct {
 		boundaries []model.ChapterBoundary
 	}
 
-	// Build batches: [1..10], [11..20], ...
 	type batch struct{ start, end int }
 	var batches []batch
 	for start := 1; start <= totalPages; start += pagesBatchSize {
@@ -163,14 +174,13 @@ func scanPagesForChapters(ctx context.Context, pdfPath string, totalPages int, p
 			defer wg.Done()
 			defer func() { <-sem }()
 
-			pages, err := pdf.ExtractPagesRange(pdfPath, b.start, b.end)
+			pages, err := opts.loadPages(pdfPath, b.start, b.end)
 			if err != nil {
 				fmt.Printf("[warn] batch %d-%d extraction failed: %v\n", b.start, b.end, err)
 				return
 			}
 
 			prompt := buildBatchDetectionPrompt(pages)
-			// Collect images across the batch for any non-text pages
 			var batchImages [][]byte
 			for _, p := range pages {
 				batchImages = append(batchImages, p.Images...)
@@ -203,14 +213,12 @@ func scanPagesForChapters(ctx context.Context, pdfPath string, totalPages int, p
 	}
 	wg.Wait()
 
-	// Collect all boundaries
 	var boundaries []model.ChapterBoundary
 	for _, br := range batchResults {
 		boundaries = append(boundaries, br.boundaries...)
 	}
 
 	if len(boundaries) == 0 {
-		// Treat the whole document as one chapter
 		boundaries = []model.ChapterBoundary{{StartPage: 1, Title: filepath.Base(pdfPath)}}
 	}
 
@@ -220,7 +228,7 @@ func scanPagesForChapters(ctx context.Context, pdfPath string, totalPages int, p
 // summarizeChapter sends all pages of a chapter to the LLM for summarization,
 // validates the response, and falls back to text extraction if the LLM refuses.
 func summarizeChapter(ctx context.Context, pdfPath string, ch model.Chapter, prov provider.Provider, opts Options) (string, model.SummaryStatus, error) {
-	pages, err := pdf.ExtractPagesRange(pdfPath, ch.StartPage, ch.EndPage)
+	pages, err := opts.loadPages(pdfPath, ch.StartPage, ch.EndPage)
 	if err != nil {
 		return "", model.SummaryFailed, err
 	}
@@ -240,9 +248,8 @@ func summarizeChapter(ctx context.Context, pdfPath string, ch model.Chapter, pro
 	}
 
 	fullText := strings.Join(textParts, "\n")
-	// Limit text to avoid overflowing context (~24k chars ≈ ~8k tokens)
-	if len(fullText) > 24000 {
-		fullText = fullText[:24000] + "\n[...content truncated for length...]"
+	if len(fullText) > maxChapterChars {
+		fullText = fullText[:maxChapterChars] + "\n[...content truncated for length...]"
 	}
 
 	basePrompt := buildSummaryPrompt(ch, fullText)
@@ -784,7 +791,6 @@ func parseJSON(s string, v any) error {
 	s = strings.TrimPrefix(s, "```json")
 	s = strings.TrimPrefix(s, "```")
 	s = strings.TrimSuffix(s, "```")
-	// Find first [ or {
 	for i, c := range s {
 		if c == '[' || c == '{' {
 			s = s[i:]

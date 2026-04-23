@@ -26,6 +26,10 @@ func (f *flakyProvider) Complete(_ context.Context, _ string) (Response, error) 
 	return Response{Content: "ok"}, nil
 }
 
+func (f *flakyProvider) CompleteJSON(ctx context.Context, prompt string) (Response, error) {
+	return f.Complete(ctx, prompt)
+}
+
 func (f *flakyProvider) CompleteMultimodal(_ context.Context, _ string, _ [][]byte) (Response, error) {
 	return f.Complete(context.Background(), "")
 }

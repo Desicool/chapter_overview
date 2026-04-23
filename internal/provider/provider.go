@@ -19,7 +19,12 @@ type Response struct {
 
 // Provider is the interface all LLM backends must implement.
 type Provider interface {
+	// Complete sends a text-only prompt; returns prose.
 	Complete(ctx context.Context, prompt string) (Response, error)
+	// CompleteJSON sends a prompt and forces JSON output using the provider's
+	// detection model (typically smaller/faster than the summarization model).
+	CompleteJSON(ctx context.Context, prompt string) (Response, error)
+	// CompleteMultimodal sends text + images to the vision model.
 	CompleteMultimodal(ctx context.Context, prompt string, images [][]byte) (Response, error)
 }
 
@@ -27,6 +32,7 @@ type Provider interface {
 type Config struct {
 	TextModel   string
 	VisionModel string
+	DetectModel string // lightweight model for detection/merging; defaults to provider default
 }
 
 type factory func(cfg Config) (Provider, error)
