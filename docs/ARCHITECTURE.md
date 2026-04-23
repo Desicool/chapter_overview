@@ -62,7 +62,11 @@ POST /api/tasks  ──►  task.Worker (goroutine pool)
 
 ### 4. LLM-batched chapter detection
 
-When no embedded TOC is present, `scanPagesForChapters` sends pages in batches of 15 to the LLM (`pagesBatchSize = 15`, `pipeline.go`). Each call returns a JSON array of `{"page": N, "title": "…"}`. Boundaries are merged and capped at 15 chapters via `finalizeStructure`.
+When no embedded TOC is present, `scanPagesForChapters` sends pages in batches of 15 to the LLM (`pagesBatchSize = 15`, `pipeline.go`). Each call returns a JSON array of `{"page": N, "title": "…"}`. Boundaries are merged and capped at 15 chapters via `finalizeStructure`, which enforces three correctness guarantees:
+
+- **Full page coverage.** `tocToChapters` extends the first chapter's `start_page` to 1 when the earliest detected boundary falls after page 1. This ensures every physical PDF page belongs to exactly one chapter.
+- **Pre-front-matter filtering.** Any content boundary detected before the first front-matter section (title pages, edition notices, etc.) is dropped from the content pool before consolidation. These pages are covered by the Front Matter bucket, preventing their titles from being merged into real chapter names.
+- **Consolidation count validation.** When the LLM is asked to reduce content to exactly N chapters, `consolidateContentViaLLM` rejects the response if the returned count ≠ N (e.g., the LLM emits two objects for a single merged chapter). On rejection, the caller falls back to evenly-sampled boundaries.
 
 ### 5. Fallback readability guard
 

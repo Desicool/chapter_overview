@@ -652,6 +652,21 @@ func finalizeStructure(ctx context.Context, boundaries []model.ChapterBoundary, 
 		}
 	}
 
+	// Any content boundary that appears before the first front-matter section is
+	// pre-preamble material (title page, edition notice, etc.) that the heuristic
+	// misclassified as content. Drop it from the content pool; the front-matter
+	// bucket (extended to page 1 by tocToChapters) will cover those pages.
+	if len(front) > 0 {
+		firstFrontPage := front[0].StartPage
+		filtered := content[:0]
+		for _, b := range content {
+			if b.StartPage >= firstFrontPage {
+				filtered = append(filtered, b)
+			}
+		}
+		content = filtered
+	}
+
 	// Budget: the remaining slots for content titles after reserving front/back.
 	budget := maxChapters
 	if len(front) > 0 {
@@ -707,10 +722,11 @@ Rules:
 - Merge the two shortest consecutive chapters first; repeat until count = %d.
 - Never merge two substantial numbered chapters unless unavoidable.
 - Preserve original chapter order.
+- When you merge chapters A and B into one, output EXACTLY ONE JSON object using the start_page of the EARLIER chapter (A). Do NOT output a separate entry for the later chapter.
 - The merged title should describe both original chapters (e.g., "Chapters 3-4: Foundations").
 
-Respond ONLY with a JSON array, no extra text:
-[{"title":"Merged Title","start_page":1}, ...]`, budget, budget)
+Respond ONLY with a JSON array of exactly %d objects, no extra text:
+[{"title":"Merged Title","start_page":1}, ...]`, budget, budget, budget)
 
 	start := time.Now()
 	result, err := prov.Complete(ctx, sb.String())
@@ -736,6 +752,9 @@ Respond ONLY with a JSON array, no extra text:
 		if r.StartPage > 0 && r.Title != "" {
 			merged = append(merged, model.ChapterBoundary{StartPage: r.StartPage, Title: r.Title})
 		}
+	}
+	if len(merged) != budget {
+		return nil // count mismatch means LLM didn't follow instructions; caller falls back to sampling
 	}
 	return merged
 }
@@ -821,6 +840,11 @@ func tocToChapters(boundaries []model.ChapterBoundary, totalPages int) []model.C
 	sort.Slice(boundaries, func(i, j int) bool {
 		return boundaries[i].StartPage < boundaries[j].StartPage
 	})
+
+	// Extend the first chapter to page 1 so no pages are dropped.
+	if len(boundaries) > 0 && boundaries[0].StartPage > 1 {
+		boundaries[0].StartPage = 1
+	}
 
 	chapters := make([]model.Chapter, len(boundaries))
 	for i, b := range boundaries {
