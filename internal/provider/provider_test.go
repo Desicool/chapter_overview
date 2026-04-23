@@ -15,6 +15,13 @@ func (m *mockProvider) Complete(_ context.Context, _ string) (Response, error) {
 	}, nil
 }
 
+func (m *mockProvider) CompleteJSON(_ context.Context, _ string) (Response, error) {
+	return Response{
+		Content: `{"ok":true}`,
+		Usage:   Usage{InputTokens: 10, OutputTokens: 5},
+	}, nil
+}
+
 func (m *mockProvider) CompleteMultimodal(_ context.Context, _ string, _ [][]byte) (Response, error) {
 	return Response{
 		Content: "ok",

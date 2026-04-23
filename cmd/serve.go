@@ -8,7 +8,6 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/desico/chapter-overview/internal/metrics"
-	"github.com/desico/chapter-overview/internal/pipeline"
 	"github.com/desico/chapter-overview/internal/provider"
 	"github.com/desico/chapter-overview/internal/server"
 	"github.com/desico/chapter-overview/internal/task"
@@ -24,13 +23,15 @@ var serveCmd = &cobra.Command{
 }
 
 var (
-	flagPort            int
-	flagDataDir         string
-	flagDB              string
-	flagServeConcurrent int
-	flagServeProvider   string
-	flagServeText       string
-	flagServeVision     string
+	flagPort               int
+	flagDataDir            string
+	flagDB                 string
+	flagServeConcurrent    int
+	flagServeLLMConcurrent int
+	flagServeProvider      string
+	flagServeText          string
+	flagServeVision        string
+	flagServeDetect        string
 )
 
 func init() {
@@ -38,10 +39,12 @@ func init() {
 	serveCmd.Flags().IntVar(&flagPort, "port", 8080, "HTTP port")
 	serveCmd.Flags().StringVar(&flagDataDir, "data-dir", "./data", "Directory for uploaded PDFs")
 	serveCmd.Flags().StringVar(&flagDB, "db", "./tasks.db", "SQLite database path")
-	serveCmd.Flags().IntVar(&flagServeConcurrent, "max-concurrent", 3, "Max parallel pipeline workers")
+	serveCmd.Flags().IntVar(&flagServeConcurrent, "max-concurrent", 3, "Max simultaneous PDF tasks")
+	serveCmd.Flags().IntVar(&flagServeLLMConcurrent, "max-llm-concurrent", 50, "Max parallel LLM calls per task")
 	serveCmd.Flags().StringVar(&flagServeProvider, "provider", "kimi", "LLM provider")
-	serveCmd.Flags().StringVar(&flagServeText, "text-model", "", "Text model override")
+	serveCmd.Flags().StringVar(&flagServeText, "text-model", "", "Summarization model override")
 	serveCmd.Flags().StringVar(&flagServeVision, "vision-model", "", "Vision model override")
+	serveCmd.Flags().StringVar(&flagServeDetect, "detect-model", "", "Detection model override (default: moonshot-v1-8k)")
 }
 
 func runServe(_ *cobra.Command, _ []string) error {
@@ -71,15 +74,13 @@ func runServe(_ *cobra.Command, _ []string) error {
 	prov, err := provider.Get(flagServeProvider, provider.Config{
 		TextModel:   flagServeText,
 		VisionModel: flagServeVision,
+		DetectModel: flagServeDetect,
 	})
 	if err != nil {
 		return fmt.Errorf("initializing provider: %w", err)
 	}
 
-	pipelineOpts := pipeline.Options{MaxConcurrent: flagServeConcurrent}
-	_ = pipelineOpts // options are threaded through by worker
-
-	worker := task.NewWorker(store, hub, prov, flagServeConcurrent, metricsReg, flagDataDir)
+	worker := task.NewWorker(store, hub, prov, flagServeConcurrent, flagServeLLMConcurrent, metricsReg, flagDataDir)
 	engine := server.New(store, hub, worker, metricsReg.Handler(), flagDataDir, WebFS)
 
 	fmt.Printf("Listening on :%d\n", flagPort)
